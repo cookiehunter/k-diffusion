@@ -469,13 +469,18 @@ def sample_dpmpp_2s_ancestral(model, x, sigmas, extra_args=None, callback=None, 
 
 
 @torch.no_grad()
-def sample_dpmpp_2m(model, x, sigmas, extra_args=None, callback=None, disable=None):
+def sample_dpmpp_2m(model, x, sigmas, extra_args=None, callback=None, disable=None, step_mask=None):
     """DPM-Solver++(2M)."""
     extra_args = {} if extra_args is None else extra_args
     s_in = x.new_ones([x.shape[0]])
     sigma_fn = lambda t: t.neg().exp()
     t_fn = lambda sigma: sigma.log().neg()
-    old_denoised = None
+
+    if step_mask is None:
+        old_denoised = None
+    else:
+        old_denoised = x
+        x0 = x
 
     for i in trange(len(sigmas) - 1, disable=disable):
         denoised = model(x, sigmas[i] * s_in, i, **extra_args)
@@ -483,12 +488,31 @@ def sample_dpmpp_2m(model, x, sigmas, extra_args=None, callback=None, disable=No
             callback({'x': x, 'i': i, 'sigma': sigmas[i], 'sigma_hat': sigmas[i], 'denoised': denoised})
         t, t_next = t_fn(sigmas[i]), t_fn(sigmas[i + 1])
         h = t_next - t
-        if old_denoised is None or sigmas[i + 1] == 0:
-            x = (sigma_fn(t_next) / sigma_fn(t)) * x - (-h).expm1() * denoised
+
+        if step_mask is None:
+            if old_denoised is None or sigmas[i + 1] == 0:
+                x = (sigma_fn(t_next) / sigma_fn(t)) * x - (-h).expm1() * denoised
+            else:
+                h_last = t - t_fn(sigmas[i - 1])
+                r = h_last / h
+                denoised_d = (1 + 1 / (2 * r)) * denoised - (1 / (2 * r)) * old_denoised
+                x = (sigma_fn(t_next) / sigma_fn(t)) * x - (-h).expm1() * denoised_d
+
         else:
+            is_sigmas_zero = sigmas[i + 1] == 0
+            is_old_denoised_none = i <= step_mask
+            initial_condition = torch.logical_or(is_sigmas_zero, is_old_denoised_none)
+
+            x_initial = (sigma_fn(t_next) / sigma_fn(t)) * x - (-h).expm1() * denoised
+
             h_last = t - t_fn(sigmas[i - 1])
             r = h_last / h
             denoised_d = (1 + 1 / (2 * r)) * denoised - (1 / (2 * r)) * old_denoised
-            x = (sigma_fn(t_next) / sigma_fn(t)) * x - (-h).expm1() * denoised_d
+            x_other = (sigma_fn(t_next) / sigma_fn(t)) * x - (-h).expm1() * denoised_d
+
+            x = torch.where(initial_condition, x_initial, x_other)
+            pixel_enabled = i >= step_mask
+            x = torch.where(pixel_enabled, x, x0)
+        
         old_denoised = denoised
     return x
